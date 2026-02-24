@@ -1,0 +1,22 @@
+[package]
+name = "rehyke-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI for Rehyke web crawler"
+
+[[bin]]
+name = "rehyke"
+path = "src/main.rs"
+
+[dependencies]
+rehyke-core = { path = "../rehyke-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+indicatif = "0.17"
+console = "0.15"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde_json = { workspace = true }

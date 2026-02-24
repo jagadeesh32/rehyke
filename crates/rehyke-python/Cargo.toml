@@ -1,0 +1,16 @@
+[package]
+name = "rehyke-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Python bindings for Rehyke web crawler"
+
+[lib]
+name = "rehyke"
+crate-type = ["cdylib"]
+
+[dependencies]
+rehyke-core = { path = "../rehyke-core" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+tokio = { workspace = true }
