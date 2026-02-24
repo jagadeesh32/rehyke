@@ -1,6 +1,7 @@
 use crate::config::DelayStrategy;
 use rand::seq::SliceRandom;
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::debug;
 
@@ -9,15 +10,22 @@ use tracing::debug;
 pub struct AntiDetect {
     ua_pool: Vec<String>,
     delay_strategy: DelayStrategy,
+    /// Current adaptive delay in milliseconds, adjusted based on server feedback.
+    adaptive_delay_ms: AtomicU64,
 }
 
 impl AntiDetect {
     /// Create a new `AntiDetect` instance with a built-in pool of realistic
     /// user agent strings and the supplied delay strategy.
     pub fn new(delay_strategy: DelayStrategy) -> Self {
+        let initial_ms = match &delay_strategy {
+            DelayStrategy::Adaptive { initial } => initial.as_millis() as u64,
+            _ => 0,
+        };
         Self {
             ua_pool: build_ua_pool(),
             delay_strategy,
+            adaptive_delay_ms: AtomicU64::new(initial_ms),
         }
     }
 
@@ -54,20 +62,78 @@ impl AntiDetect {
                 debug!(delay_ms = ms, "random delay");
                 d
             }
-            DelayStrategy::Adaptive { initial } => {
-                // Without server response-time feedback the adaptive strategy
-                // returns the initial delay.  A full adaptive implementation
-                // would track response latencies and scale accordingly; that
-                // integration happens at the engine level where response
-                // timings are available.
-                debug!(delay_ms = initial.as_millis() as u64, "adaptive delay (initial, no feedback)");
-                *initial
+            DelayStrategy::Adaptive { .. } => {
+                let ms = self.adaptive_delay_ms.load(Ordering::Relaxed);
+                debug!(delay_ms = ms, "adaptive delay");
+                Duration::from_millis(ms)
             }
             DelayStrategy::None => {
                 debug!("no delay");
                 Duration::ZERO
             }
         }
+    }
+
+    /// Record a server response to adjust adaptive delay.
+    ///
+    /// - On rate-limit responses (429, 503): doubles the delay (up to 30s).
+    /// - On server errors (500, 502, 504): increases delay by 50%.
+    /// - On success (2xx) with fast response: gradually reduces delay toward
+    ///   the initial value (decays by 10%).
+    /// - For non-adaptive strategies this is a no-op.
+    pub fn record_response(&self, status: u16, _elapsed: Duration) {
+        if !matches!(self.delay_strategy, DelayStrategy::Adaptive { .. }) {
+            return;
+        }
+
+        let initial_ms = match &self.delay_strategy {
+            DelayStrategy::Adaptive { initial } => initial.as_millis() as u64,
+            _ => return,
+        };
+
+        let current = self.adaptive_delay_ms.load(Ordering::Relaxed);
+        let max_delay_ms = 30_000u64;
+
+        let new_delay = match status {
+            429 | 503 => {
+                // Rate limited or service unavailable — double the delay.
+                let doubled = current.saturating_mul(2).max(initial_ms);
+                debug!(
+                    status,
+                    old_delay_ms = current,
+                    new_delay_ms = doubled.min(max_delay_ms),
+                    "adaptive: rate limited, increasing delay"
+                );
+                doubled.min(max_delay_ms)
+            }
+            500 | 502 | 504 => {
+                // Server error — increase by 50%.
+                let increased = current.saturating_add(current / 2).max(initial_ms);
+                debug!(
+                    status,
+                    old_delay_ms = current,
+                    new_delay_ms = increased.min(max_delay_ms),
+                    "adaptive: server error, increasing delay"
+                );
+                increased.min(max_delay_ms)
+            }
+            200..=299 => {
+                // Success — decay delay by 10% toward the initial.
+                let decayed = current.saturating_sub(current / 10);
+                let result = decayed.max(initial_ms);
+                if result < current {
+                    debug!(
+                        old_delay_ms = current,
+                        new_delay_ms = result,
+                        "adaptive: success, decreasing delay"
+                    );
+                }
+                result
+            }
+            _ => current,
+        };
+
+        self.adaptive_delay_ms.store(new_delay, Ordering::Relaxed);
     }
 
     /// Return a set of realistic browser headers suitable for inclusion in
@@ -315,6 +381,78 @@ mod tests {
         let ad = AntiDetect::new(DelayStrategy::Adaptive { initial });
         let d = ad.get_delay();
         assert_eq!(d, initial);
+    }
+
+    #[test]
+    fn test_adaptive_delay_increases_on_429() {
+        let initial = Duration::from_millis(100);
+        let ad = AntiDetect::new(DelayStrategy::Adaptive { initial });
+        assert_eq!(ad.get_delay(), initial);
+
+        ad.record_response(429, Duration::from_millis(500));
+        let after = ad.get_delay();
+        assert!(after > initial, "delay should increase after 429, got {:?}", after);
+        assert_eq!(after, Duration::from_millis(200)); // doubled
+    }
+
+    #[test]
+    fn test_adaptive_delay_increases_on_503() {
+        let initial = Duration::from_millis(100);
+        let ad = AntiDetect::new(DelayStrategy::Adaptive { initial });
+
+        ad.record_response(503, Duration::from_millis(500));
+        let after = ad.get_delay();
+        assert_eq!(after, Duration::from_millis(200)); // doubled
+    }
+
+    #[test]
+    fn test_adaptive_delay_increases_on_500() {
+        let initial = Duration::from_millis(100);
+        let ad = AntiDetect::new(DelayStrategy::Adaptive { initial });
+
+        ad.record_response(500, Duration::from_millis(500));
+        let after = ad.get_delay();
+        assert_eq!(after, Duration::from_millis(150)); // +50%
+    }
+
+    #[test]
+    fn test_adaptive_delay_decays_on_success() {
+        let initial = Duration::from_millis(100);
+        let ad = AntiDetect::new(DelayStrategy::Adaptive { initial });
+
+        // First ramp up.
+        ad.record_response(429, Duration::from_millis(500));
+        assert_eq!(ad.get_delay(), Duration::from_millis(200));
+
+        // Then decay on success.
+        ad.record_response(200, Duration::from_millis(100));
+        let after = ad.get_delay();
+        assert!(after < Duration::from_millis(200), "delay should decay on success");
+        assert!(after >= initial, "delay should not go below initial");
+    }
+
+    #[test]
+    fn test_adaptive_delay_capped_at_30s() {
+        let initial = Duration::from_millis(10_000);
+        let ad = AntiDetect::new(DelayStrategy::Adaptive { initial });
+
+        // Double to 20s.
+        ad.record_response(429, Duration::from_millis(500));
+        assert_eq!(ad.get_delay(), Duration::from_millis(20_000));
+
+        // Double to 40s, but capped at 30s.
+        ad.record_response(429, Duration::from_millis(500));
+        assert_eq!(ad.get_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_record_response_noop_for_non_adaptive() {
+        let ad = AntiDetect::new(DelayStrategy::Fixed {
+            delay: Duration::from_millis(100),
+        });
+        // Should not panic or change anything.
+        ad.record_response(429, Duration::from_millis(500));
+        assert_eq!(ad.get_delay(), Duration::from_millis(100));
     }
 
     #[test]

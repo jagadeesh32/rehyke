@@ -1,4 +1,4 @@
-use crate::config::{ProxyAuth, ProxyConfig, ProxyStrategy, ProxyType};
+use crate::config::{ProxyConfig, ProxyStrategy, ProxyType};
 use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::debug;
@@ -8,12 +8,17 @@ pub struct ProxyPool {
     proxies: Vec<ProxyConfig>,
     strategy: ProxyStrategy,
     current_index: AtomicUsize,
+    /// Per-proxy usage counters for the LeastUsed strategy.
+    usage_counts: Vec<AtomicUsize>,
 }
 
 impl ProxyPool {
     /// Create a new proxy pool with the given list of proxies and selection
     /// strategy.
     pub fn new(proxies: Vec<ProxyConfig>, strategy: ProxyStrategy) -> Self {
+        let usage_counts = (0..proxies.len())
+            .map(|_| AtomicUsize::new(0))
+            .collect();
         debug!(
             proxy_count = proxies.len(),
             strategy = ?strategy,
@@ -23,6 +28,7 @@ impl ProxyPool {
             proxies,
             strategy,
             current_index: AtomicUsize::new(0),
+            usage_counts,
         }
     }
 
@@ -37,9 +43,11 @@ impl ProxyPool {
         match self.strategy {
             ProxyStrategy::RoundRobin => {
                 let idx = self.current_index.fetch_add(1, Ordering::Relaxed);
-                let proxy = &self.proxies[idx % self.proxies.len()];
+                let actual = idx % self.proxies.len();
+                let proxy = &self.proxies[actual];
+                self.usage_counts[actual].fetch_add(1, Ordering::Relaxed);
                 debug!(
-                    index = idx % self.proxies.len(),
+                    index = actual,
                     url = %proxy.url,
                     "round-robin proxy selected"
                 );
@@ -49,6 +57,7 @@ impl ProxyPool {
                 let mut rng = rand::thread_rng();
                 let idx = rng.gen_range(0..self.proxies.len());
                 let proxy = &self.proxies[idx];
+                self.usage_counts[idx].fetch_add(1, Ordering::Relaxed);
                 debug!(
                     index = idx,
                     url = %proxy.url,
@@ -57,15 +66,23 @@ impl ProxyPool {
                 Some(proxy)
             }
             ProxyStrategy::LeastUsed => {
-                // Without per-proxy usage counters, LeastUsed falls back to
-                // round-robin.  Full implementation would require an
-                // AtomicUsize per proxy tracking in-flight requests.
-                let idx = self.current_index.fetch_add(1, Ordering::Relaxed);
-                let proxy = &self.proxies[idx % self.proxies.len()];
+                // Find the proxy with the lowest usage count.
+                let mut min_idx = 0;
+                let mut min_count = self.usage_counts[0].load(Ordering::Relaxed);
+                for i in 1..self.proxies.len() {
+                    let count = self.usage_counts[i].load(Ordering::Relaxed);
+                    if count < min_count {
+                        min_count = count;
+                        min_idx = i;
+                    }
+                }
+                let proxy = &self.proxies[min_idx];
+                self.usage_counts[min_idx].fetch_add(1, Ordering::Relaxed);
                 debug!(
-                    index = idx % self.proxies.len(),
+                    index = min_idx,
+                    usage = min_count + 1,
                     url = %proxy.url,
-                    "least-used proxy selected (round-robin fallback)"
+                    "least-used proxy selected"
                 );
                 Some(proxy)
             }
@@ -75,9 +92,11 @@ impl ProxyPool {
                 // failure.  Here we always return the current index which
                 // starts at 0.
                 let idx = self.current_index.load(Ordering::Relaxed);
-                let proxy = &self.proxies[idx % self.proxies.len()];
+                let actual = idx % self.proxies.len();
+                let proxy = &self.proxies[actual];
+                self.usage_counts[actual].fetch_add(1, Ordering::Relaxed);
                 debug!(
-                    index = idx % self.proxies.len(),
+                    index = actual,
                     url = %proxy.url,
                     "failover proxy selected"
                 );
@@ -101,6 +120,14 @@ impl ProxyPool {
     /// Return the number of proxies in the pool.
     pub fn len(&self) -> usize {
         self.proxies.len()
+    }
+
+    /// Return the usage count for a specific proxy index.
+    pub fn usage_count(&self, index: usize) -> usize {
+        self.usage_counts
+            .get(index)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 }
 
@@ -228,6 +255,68 @@ mod tests {
         pool.advance_failover();
         // Wraps around.
         assert_eq!(pool.next_proxy().unwrap().url, "http://primary:8080");
+    }
+
+    // -----------------------------------------------------------------------
+    // Least-used strategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_least_used_distributes_evenly() {
+        let proxies = vec![
+            make_proxy("http://proxy1:8080"),
+            make_proxy("http://proxy2:8080"),
+            make_proxy("http://proxy3:8080"),
+        ];
+        let pool = ProxyPool::new(proxies, ProxyStrategy::LeastUsed);
+
+        // Each call should pick the proxy with the fewest uses.
+        // First round: all at 0, picks proxy1 (idx 0).
+        let p1 = pool.next_proxy().unwrap().url.clone();
+        assert_eq!(p1, "http://proxy1:8080");
+
+        // proxy1 has 1 use, proxy2 and proxy3 have 0.
+        let p2 = pool.next_proxy().unwrap().url.clone();
+        assert_eq!(p2, "http://proxy2:8080");
+
+        // proxy1=1, proxy2=1, proxy3=0.
+        let p3 = pool.next_proxy().unwrap().url.clone();
+        assert_eq!(p3, "http://proxy3:8080");
+
+        // All at 1 now, picks proxy1 again (first with min).
+        let p4 = pool.next_proxy().unwrap().url.clone();
+        assert_eq!(p4, "http://proxy1:8080");
+    }
+
+    #[test]
+    fn test_least_used_single_proxy() {
+        let proxies = vec![make_proxy("http://only:8080")];
+        let pool = ProxyPool::new(proxies, ProxyStrategy::LeastUsed);
+
+        for i in 0..5 {
+            assert_eq!(pool.next_proxy().unwrap().url, "http://only:8080");
+            assert_eq!(pool.usage_count(0), i + 1);
+        }
+    }
+
+    #[test]
+    fn test_usage_count_tracking() {
+        let proxies = vec![
+            make_proxy("http://proxy1:8080"),
+            make_proxy("http://proxy2:8080"),
+        ];
+        let pool = ProxyPool::new(proxies, ProxyStrategy::RoundRobin);
+
+        assert_eq!(pool.usage_count(0), 0);
+        assert_eq!(pool.usage_count(1), 0);
+
+        pool.next_proxy(); // proxy1
+        assert_eq!(pool.usage_count(0), 1);
+        assert_eq!(pool.usage_count(1), 0);
+
+        pool.next_proxy(); // proxy2
+        assert_eq!(pool.usage_count(0), 1);
+        assert_eq!(pool.usage_count(1), 1);
     }
 
     // -----------------------------------------------------------------------
