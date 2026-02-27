@@ -155,6 +155,7 @@ impl ProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProxyAuth;
 
     fn make_proxy(url: &str) -> ProxyConfig {
         ProxyConfig {

@@ -1,10 +1,12 @@
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rehyke_core::config::{
     CrawlConfig as CoreCrawlConfig, CrawlConfigBuilder, DelayStrategy,
-    ScanMode as CoreScanMode,
+    ScanMode as CoreScanMode, ScreenshotFormat as CoreScreenshotFormat,
+    Viewport as CoreViewport, WaitStrategy,
 };
 use rehyke_core::error::RehykeError;
 use rehyke_core::output::CrawlResult as CoreCrawlResult;
@@ -14,7 +16,6 @@ use rehyke_core::Rehyke as CoreRehyke;
 // Error conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a [`RehykeError`] into a Python exception.
 fn to_py_err(err: RehykeError) -> PyErr {
     match err {
         RehykeError::Timeout { .. } => PyTimeoutError::new_err(err.to_string()),
@@ -85,16 +86,28 @@ struct CrawlResult {
     /// Content-Type header value from the response.
     #[pyo3(get)]
     content_type: String,
+    /// How the page was rendered: "static" or "javascript".
+    #[pyo3(get)]
+    render_method: String,
+    /// Crawl depth at which this page was discovered.
+    #[pyo3(get)]
+    depth: u32,
 }
 
 impl From<CoreCrawlResult> for CrawlResult {
     fn from(r: CoreCrawlResult) -> Self {
+        let render_method = match r.render_method {
+            rehyke_core::output::RenderMethod::Static => "static".to_string(),
+            rehyke_core::output::RenderMethod::JavaScript => "javascript".to_string(),
+        };
         Self {
             url: r.url,
             title: r.title,
             markdown: r.markdown,
             status_code: r.status_code,
             content_type: r.content_type,
+            render_method,
+            depth: r.depth,
         }
     }
 }
@@ -103,8 +116,8 @@ impl From<CoreCrawlResult> for CrawlResult {
 impl CrawlResult {
     fn __repr__(&self) -> String {
         format!(
-            "CrawlResult(url='{}', title='{}', status_code={})",
-            self.url, self.title, self.status_code
+            "CrawlResult(url='{}', title='{}', status_code={}, render='{}')",
+            self.url, self.title, self.status_code, self.render_method
         )
     }
 
@@ -120,6 +133,23 @@ impl CrawlResult {
 /// Configuration for a crawl job.
 ///
 /// All parameters are optional and have sensible defaults.
+///
+/// v0.2.0 adds JavaScript rendering parameters:
+///
+/// ```python
+/// config = CrawlConfig(
+///     enable_js=True,
+///     js_wait_strategy="network_idle",
+///     js_wait_timeout=10.0,
+///     scroll_count=5,
+///     dismiss_popups=True,
+///     viewport="desktop",
+///     screenshot=True,
+///     screenshot_format="png",
+///     detect_spa=True,
+///     randomize_fingerprint=True,
+/// )
+/// ```
 #[pyclass]
 #[derive(Debug, Clone)]
 struct CrawlConfig {
@@ -146,6 +176,16 @@ impl CrawlConfig {
         include_patterns = None,
         delay_min_ms = None,
         delay_max_ms = None,
+        js_wait_strategy = "auto",
+        js_wait_timeout = 10.0,
+        scroll_count = 0,
+        dismiss_popups = false,
+        viewport = "desktop",
+        screenshot = false,
+        screenshot_format = "png",
+        screenshot_dir = None,
+        detect_spa = false,
+        randomize_fingerprint = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -165,8 +205,24 @@ impl CrawlConfig {
         include_patterns: Option<Vec<String>>,
         delay_min_ms: Option<u64>,
         delay_max_ms: Option<u64>,
-    ) -> Self {
+        // v0.2.0 parameters
+        js_wait_strategy: &str,
+        js_wait_timeout: f64,
+        scroll_count: usize,
+        dismiss_popups: bool,
+        viewport: &str,
+        screenshot: bool,
+        screenshot_format: &str,
+        screenshot_dir: Option<String>,
+        detect_spa: bool,
+        randomize_fingerprint: bool,
+    ) -> PyResult<Self> {
         let core_mode: CoreScanMode = mode.unwrap_or(ScanMode::FULL).into();
+
+        let wait_strategy = parse_wait_strategy(js_wait_strategy).map_err(PyValueError::new_err)?;
+        let core_viewport = parse_viewport(viewport).map_err(PyValueError::new_err)?;
+        let core_screenshot_format =
+            parse_screenshot_format(screenshot_format).map_err(PyValueError::new_err)?;
 
         let mut builder = CrawlConfigBuilder::new()
             .mode(core_mode)
@@ -174,7 +230,21 @@ impl CrawlConfig {
             .respect_robots_txt(respect_robots_txt)
             .clean_navigation(clean_navigation)
             .clean_footers(clean_footers)
-            .clean_ads(clean_ads);
+            .clean_ads(clean_ads)
+            // v0.2.0
+            .js_wait_strategy(wait_strategy)
+            .js_wait_timeout(Duration::from_secs_f64(js_wait_timeout))
+            .js_scroll_count(scroll_count)
+            .dismiss_popups(dismiss_popups)
+            .viewport(core_viewport)
+            .screenshot(screenshot)
+            .screenshot_format(core_screenshot_format)
+            .detect_spa(detect_spa)
+            .randomize_fingerprint(randomize_fingerprint);
+
+        if let Some(dir) = screenshot_dir {
+            builder = builder.screenshot_output_dir(PathBuf::from(dir));
+        }
 
         if let Some(depth) = max_depth {
             builder = builder.max_depth(depth);
@@ -219,16 +289,78 @@ impl CrawlConfig {
             (None, None) => {}
         }
 
-        Self {
+        Ok(Self {
             inner: builder.build(),
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "CrawlConfig(mode={:?}, max_depth={}, max_pages={}, concurrency={})",
-            self.inner.mode, self.inner.max_depth, self.inner.max_pages, self.inner.concurrency
+            "CrawlConfig(mode={:?}, max_depth={}, max_pages={}, concurrency={}, enable_js={}, viewport={:?})",
+            self.inner.mode,
+            self.inner.max_depth,
+            self.inner.max_pages,
+            self.inner.concurrency,
+            self.inner.enable_js,
+            self.inner.viewport,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse helpers for string-based Python parameters
+// ---------------------------------------------------------------------------
+
+fn parse_wait_strategy(s: &str) -> Result<WaitStrategy, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(WaitStrategy::Auto),
+        "network_idle" | "networkidle" | "idle" => Ok(WaitStrategy::NetworkIdle),
+        s if s.starts_with("selector:") => {
+            let selector = s.strip_prefix("selector:").unwrap_or("").trim().to_string();
+            if selector.is_empty() {
+                Err("selector wait strategy requires a non-empty CSS selector after 'selector:'"
+                    .into())
+            } else {
+                Ok(WaitStrategy::Selector { selector })
+            }
+        }
+        s => {
+            // Try to parse as seconds for a Duration wait.
+            if let Ok(secs) = s.parse::<f64>() {
+                Ok(WaitStrategy::Duration {
+                    duration: Duration::from_secs_f64(secs),
+                })
+            } else {
+                Err(format!(
+                    "unknown js_wait_strategy '{}': expected 'auto', 'network_idle', \
+                     'selector:<CSS>', or a number of seconds",
+                    s
+                ))
+            }
+        }
+    }
+}
+
+fn parse_viewport(s: &str) -> Result<CoreViewport, String> {
+    match s.to_lowercase().as_str() {
+        "desktop" => Ok(CoreViewport::Desktop),
+        "tablet" => Ok(CoreViewport::Tablet),
+        "mobile" => Ok(CoreViewport::Mobile),
+        other => Err(format!(
+            "unknown viewport '{}': expected 'desktop', 'tablet', or 'mobile'",
+            other
+        )),
+    }
+}
+
+fn parse_screenshot_format(s: &str) -> Result<CoreScreenshotFormat, String> {
+    match s.to_lowercase().as_str() {
+        "png" => Ok(CoreScreenshotFormat::Png),
+        "jpeg" | "jpg" => Ok(CoreScreenshotFormat::Jpeg),
+        other => Err(format!(
+            "unknown screenshot_format '{}': expected 'png' or 'jpeg'",
+            other
+        )),
     }
 }
 
@@ -240,6 +372,29 @@ impl CrawlConfig {
 ///
 /// Create an instance with optional configuration, then call `crawl()` or
 /// `crawl_to_file()` to perform crawls.
+///
+/// Example with JS rendering (v0.2.0+):
+///
+/// ```python
+/// import rehyke
+///
+/// config = rehyke.CrawlConfig(
+///     enable_js=True,
+///     js_wait_strategy="network_idle",
+///     js_wait_timeout=10.0,
+///     scroll_count=5,
+///     dismiss_popups=True,
+///     viewport="desktop",
+///     screenshot=True,
+///     detect_spa=True,
+/// )
+///
+/// crawler = rehyke.Rehyke(config)
+/// results = crawler.crawl("https://react-app.example.com")
+/// for page in results:
+///     print(f"[{page.render_method}] {page.title}")
+///     print(page.markdown[:500])
+/// ```
 #[pyclass]
 #[derive(Debug)]
 struct Rehyke {
@@ -293,8 +448,11 @@ impl Rehyke {
 
     fn __repr__(&self) -> String {
         format!(
-            "Rehyke(mode={:?}, max_depth={}, concurrency={})",
-            self.config.mode, self.config.max_depth, self.config.concurrency
+            "Rehyke(mode={:?}, max_depth={}, concurrency={}, enable_js={})",
+            self.config.mode,
+            self.config.max_depth,
+            self.config.concurrency,
+            self.config.enable_js,
         )
     }
 }
@@ -345,6 +503,9 @@ fn crawl(py: Python<'_>, url: &str, mode: &str) -> PyResult<Vec<CrawlResult>> {
 // ---------------------------------------------------------------------------
 
 /// Python module for the Rehyke web crawler.
+///
+/// v0.2.0: JavaScript rendering, SPA support, infinite scroll, popup
+/// dismissal, screenshots, and browser fingerprint diversity.
 #[pymodule]
 fn rehyke(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScanMode>()?;

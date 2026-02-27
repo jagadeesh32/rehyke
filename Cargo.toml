@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "MIT OR Apache-2.0"
@@ -38,3 +38,4 @@ mime = "0.3"
 mime_guess = "2"
 encoding_rs = "0.8"
 rand = "0.8"
+chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }

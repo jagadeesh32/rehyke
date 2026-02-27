@@ -515,6 +515,53 @@ fn detect_from_body(body: &str) -> ContentType {
     ContentType::Html
 }
 
+/// Detect a [`ContentType`] from a plain Content-Type header string and a URL.
+///
+/// Used by the JS rendering path in `lib.rs` where the raw header string is
+/// available but not a full [`HeaderMap`].
+pub fn detect_content_type_from_str(content_type: &str, url: &Url) -> ContentType {
+    let ct_lower = content_type.to_lowercase();
+    if ct_lower.contains("text/html") {
+        return ContentType::Html;
+    }
+    if ct_lower.contains("application/xhtml+xml") {
+        return ContentType::Xhtml;
+    }
+    if ct_lower.contains("application/rss+xml") {
+        return ContentType::Rss;
+    }
+    if ct_lower.contains("application/atom+xml") {
+        return ContentType::Atom;
+    }
+    if ct_lower.contains("application/ld+json") {
+        return ContentType::JsonLd;
+    }
+    if ct_lower.contains("application/json") || ct_lower.contains("text/json") {
+        return ContentType::Json;
+    }
+    if ct_lower.contains("image/svg+xml") {
+        return ContentType::Svg;
+    }
+    if ct_lower.contains("text/xml") || ct_lower.contains("application/xml") {
+        return ContentType::Xml;
+    }
+    if ct_lower.contains("text/plain") {
+        return ContentType::PlainText;
+    }
+    // Fall back to extension-based detection.
+    if let Some(ext) = url_extension(url) {
+        match ext.as_str() {
+            "html" | "htm" => return ContentType::Html,
+            "json" => return ContentType::Json,
+            "xml" => return ContentType::Xml,
+            "txt" => return ContentType::PlainText,
+            "svg" => return ContentType::Svg,
+            _ => {}
+        }
+    }
+    ContentType::Html
+}
+
 /// Extract the lowercase file extension from the URL path, if any.
 fn url_extension(url: &Url) -> Option<String> {
     let path = url.path();

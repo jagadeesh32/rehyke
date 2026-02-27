@@ -30,6 +30,11 @@ mime = { workspace = true }
 mime_guess = { workspace = true }
 encoding_rs = { workspace = true }
 rand = { workspace = true }
+chromiumoxide = { workspace = true, optional = true }
+
+[features]
+default = []
+js = ["dep:chromiumoxide"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -49,3 +54,18 @@ path = "../../examples/regex_extraction.rs"
 [[example]]
 name = "content_pipeline"
 path = "../../examples/content_pipeline.rs"
+
+[[example]]
+name = "js_render"
+path = "../../examples/js_render.rs"
+required-features = ["js"]
+
+[[example]]
+name = "spa_crawl"
+path = "../../examples/spa_crawl.rs"
+required-features = ["js"]
+
+[[example]]
+name = "screenshot_capture"
+path = "../../examples/screenshot_capture.rs"
+required-features = ["js"]

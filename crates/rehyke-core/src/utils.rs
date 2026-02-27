@@ -238,6 +238,15 @@ pub fn url_to_slug(url: &Url) -> String {
     }
 }
 
+/// Parse a [`Url`] from a reference, returning a best-effort value on failure.
+///
+/// Used internally when a valid URL reference is expected but error-propagation
+/// is not appropriate (e.g. generating a screenshot filename from a URL that
+/// was already validated earlier in the pipeline).
+pub fn parse_url_lossy(url: &Url) -> Url {
+    url.clone()
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

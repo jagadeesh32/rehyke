@@ -5,11 +5,160 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Viewport (v0.2.0 — headless browser viewport profiles)
+// ---------------------------------------------------------------------------
+
+/// Viewport size profile used when rendering pages with a headless browser.
+///
+/// Pass to [`CrawlConfigBuilder::viewport`] to control which browser size
+/// Chrome emulates when JS rendering is enabled.
+///
+/// # Examples
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, Viewport};
+///
+/// // Desktop (1920×1080, no touch)
+/// let cfg = CrawlConfigBuilder::new().viewport(Viewport::Desktop).build();
+/// assert_eq!(cfg.viewport.dimensions(), (1920, 1080));
+/// assert!(!cfg.viewport.is_mobile());
+///
+/// // Mobile (390×844, 3× DPR, touch)
+/// let cfg = CrawlConfigBuilder::new().viewport(Viewport::Mobile).build();
+/// let (w, h) = cfg.viewport.dimensions();
+/// let dpr = cfg.viewport.device_scale_factor();
+/// println!("{}×{} CSS px → {}×{} physical px", w, h,
+///          (w as f64 * dpr) as u32, (h as f64 * dpr) as u32);
+/// assert!(cfg.viewport.has_touch());
+///
+/// // Tablet (768×1024, 2× DPR, touch)
+/// let cfg = CrawlConfigBuilder::new().viewport(Viewport::Tablet).build();
+/// assert!(cfg.viewport.is_mobile());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Viewport {
+    /// 1920×1080 desktop — no touch, no mobile emulation.
+    Desktop,
+    /// 768×1024 tablet — touch enabled, 2× device pixel ratio.
+    Tablet,
+    /// 390×844 mobile — touch enabled, 3× device pixel ratio.
+    Mobile,
+}
+
+impl Viewport {
+    /// Physical pixel dimensions `(width, height)` for this profile.
+    pub fn dimensions(self) -> (u32, u32) {
+        match self {
+            Viewport::Desktop => (1920, 1080),
+            Viewport::Tablet => (768, 1024),
+            Viewport::Mobile => (390, 844),
+        }
+    }
+
+    /// Device scale factor (CSS pixel ratio) for this profile.
+    pub fn device_scale_factor(self) -> f64 {
+        match self {
+            Viewport::Desktop => 1.0,
+            Viewport::Tablet => 2.0,
+            Viewport::Mobile => 3.0,
+        }
+    }
+
+    /// Whether the profile emulates a mobile device.
+    pub fn is_mobile(self) -> bool {
+        matches!(self, Viewport::Tablet | Viewport::Mobile)
+    }
+
+    /// Whether the profile has touch support.
+    pub fn has_touch(self) -> bool {
+        matches!(self, Viewport::Tablet | Viewport::Mobile)
+    }
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Viewport::Desktop
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ScreenshotFormat (v0.2.0)
+// ---------------------------------------------------------------------------
+
+/// Image format for browser screenshots.
+///
+/// Pass to [`CrawlConfigBuilder::screenshot_format`].
+/// Defaults to `Png` when [`CrawlConfigBuilder::screenshot`] is enabled.
+///
+/// # Examples
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, ScreenshotFormat};
+/// use std::path::PathBuf;
+///
+/// // PNG — lossless, larger files, best for visual diffing
+/// let cfg = CrawlConfigBuilder::new()
+///     .screenshot(true)
+///     .screenshot_format(ScreenshotFormat::Png)
+///     .screenshot_output_dir(PathBuf::from("/tmp/shots"))
+///     .build();
+/// assert_eq!(cfg.screenshot_format, ScreenshotFormat::Png);
+///
+/// // JPEG — lossy but much smaller, good for archiving many pages
+/// let cfg = CrawlConfigBuilder::new()
+///     .screenshot(true)
+///     .screenshot_format(ScreenshotFormat::Jpeg)
+///     .build();
+/// assert_eq!(cfg.screenshot_format, ScreenshotFormat::Jpeg);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenshotFormat {
+    /// Lossless PNG (larger files, perfect quality).
+    Png,
+    /// Lossy JPEG (smaller files, configurable quality).
+    Jpeg,
+}
+
+impl Default for ScreenshotFormat {
+    fn default() -> Self {
+        ScreenshotFormat::Png
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScanMode
 // ---------------------------------------------------------------------------
 
 /// High-level crawl presets that set sensible defaults for depth, page count,
 /// and concurrency.
+///
+/// | Mode | Max depth | Max pages | Concurrency | Scope |
+/// |------|-----------|-----------|-------------|-------|
+/// | `Lite` | 2 | 100 | 5 | Single page + immediate links |
+/// | `Full` | 5 | 1 000 | 10 | Entire domain (default) |
+/// | `Deep` | 50 | 50 000 | 25 | Cross-domain exhaustive |
+///
+/// # Examples
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, ScanMode};
+///
+/// // Lite: single-page extraction, no link following
+/// let cfg = CrawlConfigBuilder::new().mode(ScanMode::Lite).build();
+/// assert_eq!(cfg.max_depth, 2);
+/// assert_eq!(cfg.max_pages, 100);
+///
+/// // Full: balanced domain-wide crawl (default)
+/// let cfg = CrawlConfigBuilder::new().mode(ScanMode::Full).build();
+/// assert_eq!(cfg.max_pages, 1_000);
+///
+/// // Deep: cross-domain exhaustive crawl
+/// let cfg = CrawlConfigBuilder::new().mode(ScanMode::Deep).build();
+/// assert_eq!(cfg.max_depth, 50);
+/// assert_eq!(cfg.concurrency, 25);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScanMode {
@@ -106,6 +255,50 @@ impl Default for FileStructure {
 // ---------------------------------------------------------------------------
 
 /// Strategy used to decide when a JS-rendered page is "ready".
+///
+/// Passed to [`CrawlConfigBuilder::js_wait_strategy`].
+///
+/// | Variant | Best for |
+/// |---------|----------|
+/// | `NetworkIdle` | React, Vue, Angular SPAs that make XHR/fetch calls on load |
+/// | `Selector` | Pages with a known "ready" element (e.g. `#app`, `.content-loaded`) |
+/// | `Duration` | Angular apps that need a fixed settle period after network idle |
+/// | `Auto` | Unknown pages — Rehyke picks a sensible heuristic |
+///
+/// # Examples
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, WaitStrategy};
+/// use std::time::Duration;
+///
+/// // Wait for network to go idle (best for most SPAs)
+/// let cfg = CrawlConfigBuilder::new()
+///     .enable_js(true)
+///     .js_wait_strategy(WaitStrategy::NetworkIdle)
+///     .build();
+///
+/// // Wait for a specific element — useful for Vue/Nuxt apps
+/// let cfg = CrawlConfigBuilder::new()
+///     .enable_js(true)
+///     .js_wait_strategy(WaitStrategy::Selector {
+///         selector: "#app, [data-v-app]".into(),
+///     })
+///     .build();
+///
+/// // Fixed 1.5-second settle time — useful for Angular change-detection
+/// let cfg = CrawlConfigBuilder::new()
+///     .enable_js(true)
+///     .js_wait_strategy(WaitStrategy::Duration {
+///         duration: Duration::from_millis(1500),
+///     })
+///     .build();
+///
+/// // Auto — let Rehyke decide
+/// let cfg = CrawlConfigBuilder::new()
+///     .enable_js(true)
+///     .js_wait_strategy(WaitStrategy::Auto)
+///     .build();
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WaitStrategy {
@@ -350,6 +543,51 @@ pub struct CrawlConfig {
     /// Strip the `www.` prefix when comparing / deduplicating URLs.
     #[serde(default = "default_true")]
     pub remove_www: bool,
+
+    // -----------------------------------------------------------------------
+    // v0.2.0 — Headless browser / JS rendering settings
+    // -----------------------------------------------------------------------
+
+    /// Viewport size profile sent to the headless browser.
+    #[serde(default)]
+    pub viewport: Viewport,
+
+    /// How many scroll operations to perform when detecting infinite-scroll
+    /// pages.  `0` disables auto-scrolling.
+    #[serde(default)]
+    pub js_scroll_count: usize,
+
+    /// Automatically detect and dismiss common popups (cookie consent banners,
+    /// GDPR modals, newsletter overlays) before extracting content.
+    #[serde(default)]
+    pub dismiss_popups: bool,
+
+    /// Capture a full-page screenshot after JavaScript has settled.
+    /// Screenshots are only taken when `enable_js` is also `true`.
+    #[serde(default)]
+    pub screenshot: bool,
+
+    /// Image format for captured screenshots.
+    #[serde(default)]
+    pub screenshot_format: ScreenshotFormat,
+
+    /// Directory where screenshot files are written.
+    /// Defaults to the current working directory when `None`.
+    pub screenshot_output_dir: Option<PathBuf>,
+
+    /// Maximum time to wait for the JS wait-strategy to be satisfied.
+    #[serde(with = "duration_serde")]
+    pub js_wait_timeout: Duration,
+
+    /// Automatically detect the SPA framework (React, Vue, Angular, …) and
+    /// apply framework-specific wait logic before extracting content.
+    #[serde(default)]
+    pub detect_spa: bool,
+
+    /// Randomize browser fingerprint details (viewport noise, WebGL vendor
+    /// strings, navigator.languages) to reduce bot-detection signals.
+    #[serde(default)]
+    pub randomize_fingerprint: bool,
 }
 
 /// Helper for serde defaults that should be `true`.
@@ -384,6 +622,16 @@ impl Default for CrawlConfig {
             custom_headers: HashMap::new(),
             cookies: HashMap::new(),
             remove_www: true,
+            // v0.2.0 fields
+            viewport: Viewport::default(),
+            js_scroll_count: 0,
+            dismiss_popups: false,
+            screenshot: false,
+            screenshot_format: ScreenshotFormat::default(),
+            screenshot_output_dir: None,
+            js_wait_timeout: Duration::from_secs(10),
+            detect_spa: false,
+            randomize_fingerprint: false,
         }
     }
 }
@@ -394,16 +642,75 @@ impl Default for CrawlConfig {
 
 /// Fluent builder for [`CrawlConfig`].
 ///
-/// Start from defaults and override only what you need:
+/// Start from defaults and override only what you need.
+/// Call [`.build()`](Self::build) at the end to obtain the final [`CrawlConfig`].
 ///
-/// ```rust,no_run
-/// use rehyke_core::config::CrawlConfigBuilder;
+/// # Examples
+///
+/// ## Static crawl — no JavaScript
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, ScanMode};
 ///
 /// let config = CrawlConfigBuilder::new()
-///     .max_depth(3)
+///     .mode(ScanMode::Full)
+///     .max_pages(500)
 ///     .concurrency(20)
-///     .enable_js(true)
+///     .clean_navigation(true)
+///     .clean_ads(true)
+///     .exclude_patterns(vec![r"\.pdf$".into(), r"/login".into()])
 ///     .build();
+///
+/// assert_eq!(config.max_pages, 500);
+/// assert!(config.clean_ads);
+/// ```
+///
+/// ## JavaScript SPA crawl (v0.2.0)
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, ScanMode, Viewport, WaitStrategy, ScreenshotFormat};
+/// use std::time::Duration;
+/// use std::path::PathBuf;
+///
+/// let config = CrawlConfigBuilder::new()
+///     .mode(ScanMode::Full)
+///     .enable_js(true)
+///     // Wait strategies: NetworkIdle | Selector { selector } | Duration { duration } | Auto
+///     .js_wait_strategy(WaitStrategy::NetworkIdle)
+///     .js_wait_timeout(Duration::from_secs(12))
+///     .js_scroll_count(8)          // scroll 8 viewports for infinite scroll
+///     .dismiss_popups(true)        // dismiss cookie/GDPR banners automatically
+///     .detect_spa(true)            // identify React/Vue/Angular in results
+///     .viewport(Viewport::Desktop) // 1920×1080 | Tablet 768×1024 | Mobile 390×844
+///     .randomize_fingerprint(true) // randomise UA, WebGL, languages, timezone
+///     // Screenshot every crawled page as PNG
+///     .screenshot(true)
+///     .screenshot_format(ScreenshotFormat::Png)
+///     .screenshot_output_dir(PathBuf::from("/tmp/shots"))
+///     .max_pages(200)
+///     .build();
+///
+/// assert!(config.enable_js);
+/// assert_eq!(config.viewport, Viewport::Desktop);
+/// assert!(config.screenshot);
+/// ```
+///
+/// ## Delay + proxy configuration
+///
+/// ```rust
+/// use rehyke_core::{CrawlConfigBuilder, DelayStrategy, ScanMode};
+/// use std::time::Duration;
+///
+/// let config = CrawlConfigBuilder::new()
+///     .mode(ScanMode::Deep)
+///     .delay_strategy(DelayStrategy::Random {
+///         min: Duration::from_millis(300),
+///         max: Duration::from_millis(1500),
+///     })
+///     .respect_robots_txt(true)
+///     .build();
+///
+/// assert!(config.respect_robots_txt);
 /// ```
 #[derive(Debug, Clone)]
 pub struct CrawlConfigBuilder {
@@ -549,6 +856,65 @@ impl CrawlConfigBuilder {
 
     pub fn remove_www(mut self, remove: bool) -> Self {
         self.inner.remove_www = remove;
+        self
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.2.0 builder methods
+    // -----------------------------------------------------------------------
+
+    /// Set the browser viewport profile (desktop / tablet / mobile).
+    pub fn viewport(mut self, viewport: Viewport) -> Self {
+        self.inner.viewport = viewport;
+        self
+    }
+
+    /// Number of scroll operations to perform for infinite-scroll detection.
+    /// Set to `0` (default) to disable auto-scrolling.
+    pub fn js_scroll_count(mut self, count: usize) -> Self {
+        self.inner.js_scroll_count = count;
+        self
+    }
+
+    /// Enable automatic popup dismissal (cookie consent, GDPR modals, etc.).
+    pub fn dismiss_popups(mut self, dismiss: bool) -> Self {
+        self.inner.dismiss_popups = dismiss;
+        self
+    }
+
+    /// Capture a full-page screenshot after JS rendering.
+    pub fn screenshot(mut self, screenshot: bool) -> Self {
+        self.inner.screenshot = screenshot;
+        self
+    }
+
+    /// Set the screenshot image format (PNG or JPEG).
+    pub fn screenshot_format(mut self, format: ScreenshotFormat) -> Self {
+        self.inner.screenshot_format = format;
+        self
+    }
+
+    /// Directory where screenshots are saved.
+    pub fn screenshot_output_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.inner.screenshot_output_dir = Some(dir.into());
+        self
+    }
+
+    /// Maximum time to wait for the JS wait-strategy to succeed.
+    pub fn js_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.inner.js_wait_timeout = timeout;
+        self
+    }
+
+    /// Enable SPA framework auto-detection and framework-specific wait logic.
+    pub fn detect_spa(mut self, detect: bool) -> Self {
+        self.inner.detect_spa = detect;
+        self
+    }
+
+    /// Randomize browser fingerprint details to reduce bot-detection signals.
+    pub fn randomize_fingerprint(mut self, randomize: bool) -> Self {
+        self.inner.randomize_fingerprint = randomize;
         self
     }
 
@@ -794,5 +1160,257 @@ mod tests {
         let json = serde_json::to_string(&output).expect("serialize");
         assert!(json.contains("\"type\":\"files\""));
         assert!(json.contains("\"mirror\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Viewport (v0.2.0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn viewport_default_is_desktop() {
+        assert_eq!(Viewport::default(), Viewport::Desktop);
+    }
+
+    #[test]
+    fn viewport_dimensions_match_spec() {
+        assert_eq!(Viewport::Desktop.dimensions(), (1920, 1080));
+        assert_eq!(Viewport::Tablet.dimensions(), (768, 1024));
+        assert_eq!(Viewport::Mobile.dimensions(), (390, 844));
+    }
+
+    #[test]
+    fn viewport_device_scale_factor() {
+        // Each profile has the correct CSS pixel ratio.
+        assert!((Viewport::Desktop.device_scale_factor() - 1.0).abs() < f64::EPSILON);
+        assert!((Viewport::Tablet.device_scale_factor() - 2.0).abs() < f64::EPSILON);
+        assert!((Viewport::Mobile.device_scale_factor() - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn viewport_is_mobile_and_has_touch() {
+        assert!(!Viewport::Desktop.is_mobile());
+        assert!(!Viewport::Desktop.has_touch());
+
+        assert!(Viewport::Tablet.is_mobile());
+        assert!(Viewport::Tablet.has_touch());
+
+        assert!(Viewport::Mobile.is_mobile());
+        assert!(Viewport::Mobile.has_touch());
+    }
+
+    #[test]
+    fn viewport_physical_pixel_dimensions() {
+        // Physical pixels = CSS pixels × device scale factor.
+        for vp in [Viewport::Desktop, Viewport::Tablet, Viewport::Mobile] {
+            let (w, h) = vp.dimensions();
+            let dpr = vp.device_scale_factor();
+            let phys_w = (w as f64 * dpr).round() as u64;
+            let phys_h = (h as f64 * dpr).round() as u64;
+            assert!(phys_w > 0, "physical width must be positive for {:?}", vp);
+            assert!(phys_h > 0, "physical height must be positive for {:?}", vp);
+        }
+    }
+
+    #[test]
+    fn viewport_serde_roundtrip() {
+        for vp in [Viewport::Desktop, Viewport::Tablet, Viewport::Mobile] {
+            let json = serde_json::to_string(&vp).expect("serialize viewport");
+            let back: Viewport = serde_json::from_str(&json).expect("deserialize viewport");
+            assert_eq!(vp, back);
+        }
+    }
+
+    #[test]
+    fn viewport_serde_values() {
+        // Serialises to lowercase strings.
+        assert_eq!(serde_json::to_string(&Viewport::Desktop).unwrap(), "\"desktop\"");
+        assert_eq!(serde_json::to_string(&Viewport::Tablet).unwrap(), "\"tablet\"");
+        assert_eq!(serde_json::to_string(&Viewport::Mobile).unwrap(), "\"mobile\"");
+    }
+
+    // -----------------------------------------------------------------------
+    // ScreenshotFormat (v0.2.0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn screenshot_format_default_is_png() {
+        assert_eq!(ScreenshotFormat::default(), ScreenshotFormat::Png);
+    }
+
+    #[test]
+    fn screenshot_format_serde_roundtrip() {
+        for fmt in [ScreenshotFormat::Png, ScreenshotFormat::Jpeg] {
+            let json = serde_json::to_string(&fmt).expect("serialize");
+            let back: ScreenshotFormat = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(fmt, back);
+        }
+    }
+
+    #[test]
+    fn screenshot_format_serde_values() {
+        assert_eq!(serde_json::to_string(&ScreenshotFormat::Png).unwrap(), "\"png\"");
+        assert_eq!(serde_json::to_string(&ScreenshotFormat::Jpeg).unwrap(), "\"jpeg\"");
+    }
+
+    // -----------------------------------------------------------------------
+    // WaitStrategy (v0.2.0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wait_strategy_default_is_auto() {
+        assert!(matches!(WaitStrategy::default(), WaitStrategy::Auto));
+    }
+
+    #[test]
+    fn wait_strategy_selector_stores_css() {
+        let ws = WaitStrategy::Selector {
+            selector: "#root".to_string(),
+        };
+        match ws {
+            WaitStrategy::Selector { selector } => assert_eq!(selector, "#root"),
+            other => panic!("expected Selector, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wait_strategy_duration_stores_value() {
+        let ws = WaitStrategy::Duration {
+            duration: std::time::Duration::from_secs(5),
+        };
+        match ws {
+            WaitStrategy::Duration { duration } => {
+                assert_eq!(duration, std::time::Duration::from_secs(5))
+            }
+            other => panic!("expected Duration, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wait_strategy_serde_roundtrip() {
+        let strategies = vec![
+            WaitStrategy::Auto,
+            WaitStrategy::NetworkIdle,
+            WaitStrategy::Selector {
+                selector: "div.ready".to_string(),
+            },
+            WaitStrategy::Duration {
+                duration: std::time::Duration::from_millis(1500),
+            },
+        ];
+        for ws in strategies {
+            let json = serde_json::to_string(&ws).expect("serialize WaitStrategy");
+            let back: WaitStrategy = serde_json::from_str(&json).expect("deserialize WaitStrategy");
+            // Compare variant by re-serialising (WaitStrategy isn't PartialEq, but json tags match).
+            let json2 = serde_json::to_string(&back).expect("re-serialize");
+            assert_eq!(json, json2);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CrawlConfigBuilder — v0.2.0 methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builder_v020_viewport() {
+        let cfg = CrawlConfigBuilder::new().viewport(Viewport::Mobile).build();
+        assert_eq!(cfg.viewport, Viewport::Mobile);
+
+        let cfg2 = CrawlConfigBuilder::new().viewport(Viewport::Tablet).build();
+        assert_eq!(cfg2.viewport, Viewport::Tablet);
+    }
+
+    #[test]
+    fn builder_v020_screenshot_fields() {
+        let dir = PathBuf::from("/tmp/shots");
+        let cfg = CrawlConfigBuilder::new()
+            .screenshot(true)
+            .screenshot_format(ScreenshotFormat::Jpeg)
+            .screenshot_output_dir(dir.clone())
+            .build();
+
+        assert!(cfg.screenshot);
+        assert_eq!(cfg.screenshot_format, ScreenshotFormat::Jpeg);
+        assert_eq!(cfg.screenshot_output_dir, Some(dir));
+    }
+
+    #[test]
+    fn builder_v020_js_fields() {
+        let timeout = Duration::from_secs(15);
+        let cfg = CrawlConfigBuilder::new()
+            .enable_js(true)
+            .js_wait_strategy(WaitStrategy::NetworkIdle)
+            .js_wait_timeout(timeout)
+            .js_scroll_count(8)
+            .dismiss_popups(true)
+            .build();
+
+        assert!(cfg.enable_js);
+        assert!(matches!(cfg.js_wait_strategy, WaitStrategy::NetworkIdle));
+        assert_eq!(cfg.js_wait_timeout, timeout);
+        assert_eq!(cfg.js_scroll_count, 8);
+        assert!(cfg.dismiss_popups);
+    }
+
+    #[test]
+    fn builder_v020_detect_spa_and_fingerprint() {
+        let cfg = CrawlConfigBuilder::new()
+            .detect_spa(true)
+            .randomize_fingerprint(true)
+            .build();
+
+        assert!(cfg.detect_spa);
+        assert!(cfg.randomize_fingerprint);
+    }
+
+    #[test]
+    fn builder_v020_selector_wait_strategy() {
+        let cfg = CrawlConfigBuilder::new()
+            .js_wait_strategy(WaitStrategy::Selector {
+                selector: "#app".to_string(),
+            })
+            .build();
+
+        assert!(matches!(
+            cfg.js_wait_strategy,
+            WaitStrategy::Selector { ref selector } if selector == "#app"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // CrawlConfig default values — v0.2.0 fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_config_v020_defaults() {
+        let cfg = CrawlConfig::default();
+
+        // JS rendering off by default.
+        assert!(!cfg.enable_js);
+        assert!(!cfg.dismiss_popups);
+        assert!(!cfg.screenshot);
+        assert!(!cfg.detect_spa);
+        assert!(!cfg.randomize_fingerprint);
+
+        // Scroll disabled by default.
+        assert_eq!(cfg.js_scroll_count, 0);
+
+        // Sensible default wait timeout.
+        assert!(cfg.js_wait_timeout >= Duration::from_secs(5),
+            "js_wait_timeout should be at least 5 s by default");
+
+        // Screenshot format defaults to PNG.
+        assert_eq!(cfg.screenshot_format, ScreenshotFormat::Png);
+
+        // No screenshot output dir by default.
+        assert!(cfg.screenshot_output_dir.is_none());
+
+        // Desktop viewport by default.
+        assert_eq!(cfg.viewport, Viewport::Desktop);
+    }
+
+    #[test]
+    fn default_config_v020_wait_strategy_is_auto() {
+        let cfg = CrawlConfig::default();
+        assert!(matches!(cfg.js_wait_strategy, WaitStrategy::Auto));
     }
 }
