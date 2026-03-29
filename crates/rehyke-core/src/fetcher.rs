@@ -64,7 +64,9 @@ pub struct Fetcher {
     client: Client,
     retry_config: RetryConfig,
     user_agent: Option<String>,
+    #[allow(dead_code)]
     custom_headers: HeaderMap,
+    #[allow(dead_code)]
     timeout: Duration,
 }
 

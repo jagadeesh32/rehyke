@@ -209,6 +209,7 @@ fn render_node(node: &ContentNode) -> String {
 }
 
 /// Render a feed item into Markdown
+#[allow(dead_code)]
 fn render_feed_item(item: &FeedItem) -> String {
     let mut result = String::new();
 

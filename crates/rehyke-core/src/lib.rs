@@ -261,8 +261,6 @@ impl Rehyke {
             max_blank_lines: 2,
         };
 
-        let enable_js = self.config.enable_js;
-
         // Main crawl loop.
         loop {
             if scheduler.is_done() {

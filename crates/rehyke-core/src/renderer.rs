@@ -37,7 +37,7 @@
 /// ```
 use crate::config::{ScreenshotFormat, Viewport, WaitStrategy};
 use crate::error::{RehykeError, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -166,6 +166,7 @@ impl Default for RendererConfig {
 
 /// Common CSS selectors for cookie / consent / GDPR popup accept buttons.
 /// Ordered from most-specific to least-specific.
+#[cfg(feature = "js")]
 const POPUP_ACCEPT_SELECTORS: &[&str] = &[
     // GDPR / privacy
     "[id*='cookie'][id*='accept']",
@@ -209,6 +210,7 @@ const POPUP_ACCEPT_SELECTORS: &[&str] = &[
 
 /// JS expressions / DOM markers used to detect SPA frameworks.
 /// Each entry is `(framework_name, js_detection_expression)`.
+#[cfg(feature = "js")]
 const SPA_DETECTORS: &[(&str, &str)] = &[
     (
         "Next.js",
@@ -247,6 +249,7 @@ const SPA_DETECTORS: &[(&str, &str)] = &[
 /// Headless browser renderer that drives Chrome/Chromium via the DevTools
 /// Protocol to execute JavaScript and extract fully-rendered page DOM.
 pub struct Renderer {
+    #[cfg_attr(not(feature = "js"), allow(dead_code))]
     config: RendererConfig,
     initialized: bool,
     /// Inner browser state — only present when the `js` feature is enabled
